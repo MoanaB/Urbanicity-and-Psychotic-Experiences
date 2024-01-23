@@ -1,0 +1,172 @@
+---
+title: "Core Analyses: 'Urbanicity and psychotic experiences: Social adversities, isolation and exposure to natural environments predict psychosis'"
+format: pdf
+editor: visual
+execute: 
+  echo: false
+  warning: false
+---
+
+```{r read-libraries}
+library(dplyr)
+library(Boruta)
+library(caret)
+library(randomForest)
+library(glmnet)
+```
+
+# 1. Boruta
+
+We will use the 'Boruta' function to find the important and unimportant attributes. All the original features having a lesser Z score than shadow max will be marked unimportant and after this as important.
+
+```{r Boruta-FeatureSelection}
+boruta_train <- list()
+boruta_final <- list()
+boruta_selected_features <- list()
+boruta_df <- list()
+rfmodel_bor <- list()
+y_predicted_bor <- list()
+conf_matrix_bor <- list()
+rfmodel_it_bor <- list()
+VI_bor <- c()
+
+for (cv in 1:cv_n) {
+  boruta_train[[cv]] <- Boruta(y ~., data = data_training[[cv]], doTrace = 0, maxRuns = 500)
+  boruta_final[[cv]] <- TentativeRoughFix(boruta_train[[cv]])
+  boruta_selected_features[[cv]] <- getSelectedAttributes(boruta_final[[cv]], withTentative = F)
+  boruta_df[[cv]] <- attStats(boruta_final[[cv]])
+    
+    if (cv == 1) {
+      boruta_df_all <- boruta_df[[cv]]
+    
+    } else {
+      boruta_df_all <- cbind(boruta_df_all, boruta_df[[cv]])
+    
+    }
+  rfmodel_it_bor[[cv]] <- randomForest(getConfirmedFormula(boruta_final[[cv]]), data = data_training[[cv]])
+  VI_bor <- rbind(VI_bor, 
+                  data.frame(
+                    Variable = rownames(rfmodel_it_bor[[cv]]$importance), 
+                    Value = as.numeric(rfmodel_it_bor[[cv]]$importance))
+                  )
+
+}
+
+boruta_df_summarised <- data.frame(
+  meanImp = rowMeans(boruta_df_all[ , names(boruta_df_all) == "meanImp"]),
+  medianImp = rowMeans(boruta_df_all[ , names(boruta_df_all) == "medianImp"]),
+  minImp = rowMeans(boruta_df_all[ , names(boruta_df_all) == "minImp"]),
+  maxImp = rowMeans(boruta_df_all[ , names(boruta_df_all) == "maxImp"]),
+  normHits = rowMeans(boruta_df_all[ , names(boruta_df_all) == "normHits"]),
+  confirmed = rowSums(boruta_df_all[ , names(boruta_df_all) == "decision"] == "Confirmed"),
+  rejected = rowSums(boruta_df_all[ , names(boruta_df_all) == "decision"] == "Rejected"),
+  sd = apply(boruta_df_all[ , names(boruta_df_all) == "meanImp"], 1, sd)
+)
+
+boruta_df_summarised$decision[boruta_df_summarised$confirmed > 5] <- "Confirmed"
+boruta_df_summarised$decision[boruta_df_summarised$confirmed <= 5] <- "Rejected"
+
+boruta_formula <- as.formula(paste('y ~', paste(rownames(boruta_df_summarised[boruta_df_summarised$decision == "Confirmed", ]), collapse = " + ")))
+
+```
+
+```{r Boruta-Validation}
+for (cv in 1:cv_n) {
+  rfmodel_bor[[cv]] <- randomForest(boruta_formula, data = data_training[[cv]])
+  y_predicted_bor[[cv]] <- predict(rfmodel_bor[[cv]], data_test[[cv]])
+  conf_matrix_bor[[cv]] <- confusionMatrix(y_predicted_bor[[cv]], factor(data_test[[cv]]$y))
+}
+```
+
+This confusion matrix was constructed by using features selected more than half the iterations across the cross-validation by the Boruta algorithm. The resulting formula was used to fit a random forests model to the different selections of training data.
+
+```{r Boruta-confusion-matrix}
+y_test_all <- c()
+for (cv in 1:cv_n) {
+  y_test_all <- c(y_test_all, unlist(data_test[[cv]]$y))
+  }
+CM_all_Boruta <- confusionMatrix(
+  factor(as.character(unlist(y_predicted_bor))), 
+  factor(y_test_all-1))
+CM_all_Boruta
+```
+
+# 2. Elastic Net Regularised Classification
+
+Numeric predictors are standardised.
+
+```{r EN-train-model}
+# Model Building : Elastic Net Regression
+control <- trainControl(method = "repeatedcv",
+                              number = 10, 
+                              repeats = 5,
+                              search = "random",
+                              verboseIter = TRUE)
+
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+
+data_train_X <- list()
+data_train_Y <- list()
+data_test_X <- list()
+data_test_z <- list()
+data_train_z <- list()
+data_preproc <- list()
+elastic_model <- list()
+en_best_model <- list()
+coefficients_EN <- c()
+
+for (cv in 1:cv_n) {
+  data_train_X[[cv]] <-  data_training[[cv]] %>% select(-y) %>% mutate_if(is.numeric, scale) %>% mutate_if(is.numeric, as.vector)
+  data_train_Y[[cv]] <- data_training[[cv]] %>% select(y)
+  data_test_X[[cv]] <- data_test[[cv]] %>% select(-y) %>% mutate_if(is.numeric,scale) %>% mutate_if(is.numeric, as.vector)
+  data_test_z[[cv]] <- data_test_X[[cv]]
+  data_test_z[[cv]]$y <- data_test[[cv]]$y
+  data_train_z[[cv]] <- as.data.frame(data_train_X[[cv]])
+  data_train_z[[cv]]$y <- data_training[[cv]]$y
+
+# Training Elastic Net Regression model
+data_preproc[[cv]] <- data.frame(cbind(data_train_X[[cv]], data_train_Y[[cv]]))
+data_preproc[[cv]]$y <- as.factor(data_preproc[[cv]]$y)
+data_preproc[[cv]] <- data_preproc[[cv]] %>% mutate_if(is.character, as.numeric)
+
+elastic_model[[cv]] <- train(y ~ .,
+                      data = data_preproc[[cv]],
+                      method = "glmnet",
+                      tuneLength = 25,
+                      trControl = control)
+
+en_best_model[[cv]] <- get_best_result(elastic_model[[cv]])
+coefficients_EN <- cbind(
+  coefficients_EN, 
+  coef(elastic_model[[cv]]$finalModel, elastic_model[[cv]]$bestTune$lambda))
+  if (cv == 1) {
+    varimportance_EN <- varImp(
+      elastic_model[[cv]]$finalModel, 
+      elastic_model[[cv]]$bestTune$lambda
+      ) 
+  } else {
+    varimportance_EN <- cbind(
+      varimportance_EN, 
+      varImp(elastic_model[[cv]]$finalModel, elastic_model[[cv]]$bestTune$lambda))
+  }
+
+}
+```
+
+```{r EN-get-model-fit}
+en_model_fit <- data.frame(
+  alpha = rep(NA,cv_n), 
+  lambda = rep(NA,cv_n), 
+  accuracy = rep(NA,cv_n))
+
+for (cv in 1:cv_n) {
+  en_model_fit$alpha[cv] <- en_best_model[[cv]]$alpha
+  en_model_fit$lambda[cv] <- en_best_model[[cv]]$lambda
+  en_model_fit$accuracy[cv] <- en_best_model[[cv]]$Accuracy
+}
+```
